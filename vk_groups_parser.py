@@ -19,6 +19,7 @@ from openpyxl import Workbook, load_workbook
 
 # Playwright
 from playwright.sync_api import Playwright, sync_playwright, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
+from urllib.parse import urlparse, urlunparse
 
 
 SEARCH_URL_TEMPLATE = "https://vk.com/search?c%5Bq%5D={query}&c%5Bsection%5D=communities"
@@ -124,7 +125,7 @@ def append_csv(file_path: str, item: GroupItem) -> None:
             writer.writerow([
                 item.index,
                 item.name,
-                item.url,
+                normalize_vk_url(item.url),
                 item.subscribers if item.subscribers is not None else "",
                 item.posting_status if item.posting_status is not None else "",
             ])
@@ -381,6 +382,22 @@ def parse_int_from_text(text: str) -> Optional[int]:
     return max(values) if values else None
 
 
+def normalize_vk_url(url: str) -> str:
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        scheme = 'https'
+        netloc = 'vk.com' if parsed.netloc.endswith('vk.ru') or parsed.netloc.endswith('vk.com') else parsed.netloc
+        path = parsed.path or '/'
+        # drop trailing slash except root
+        if len(path) > 1 and path.endswith('/'):
+            path = path[:-1]
+        return urlunparse((scheme, netloc, path, '', '', ''))
+    except Exception:
+        return url
+
+
 def extract_group_cards(page: Page) -> List[Tuple[str, str, Optional[int]]]:
     try:
         data = page.evaluate(
@@ -407,6 +424,7 @@ def extract_group_cards(page: Page) -> List[Tuple[str, str, Optional[int]]]:
                 const r = el.getBoundingClientRect();
                 return {x: r.left + r.width/2, y: r.top + r.height/2};
               }
+              // Prefer anchors without query params by stripping location search/hash
               const anchors = Array.from(document.querySelectorAll("a[href^='/public'], a[href^='/club'], a[href^='/event'], a[href^='/community']"));
               const candidates = Array.from(document.querySelectorAll("span, div"))
                 .filter(n => {
@@ -417,9 +435,14 @@ def extract_group_cards(page: Page) -> List[Tuple[str, str, Optional[int]]]:
               const seen = new Set();
               const out = [];
               for(const a of anchors){
-                const href = a.getAttribute('href')||'';
+                let href = a.getAttribute('href')||'';
                 const name = (a.textContent||a.getAttribute('aria-label')||'').trim();
                 if(!href || !name) continue;
+                // Strip search/hash
+                try{
+                  const u = new URL(href, 'https://vk.com');
+                  href = u.pathname;
+                }catch(e){ /* ignore */ }
                 const full = href.startsWith('/') ? 'https://vk.com'+href : href;
                 if(seen.has(full)) continue;
                 seen.add(full);
@@ -447,44 +470,63 @@ def extract_group_cards(page: Page) -> List[Tuple[str, str, Optional[int]]]:
         )
         results: List[Tuple[str, str, Optional[int]]] = []
         for name, url, subs in data:
-            results.append((str(name), str(url), int(subs) if subs is not None else None))
+            results.append((str(name), normalize_vk_url(str(url)), int(subs) if subs is not None else None))
         return results
     except Exception:
         return []
 
 
 def extract_posting_status(page: Page) -> Optional[str]:
+    for _ in range(3):
+        try:
+            status = page.evaluate(
+                """
+                () => {
+                  const getText = (el) => (el?.innerText || el?.textContent || "").trim();
+                  const q = (sel) => Array.from(document.querySelectorAll(sel));
+                  const createBtn = document.querySelector('button[data-testid="posting_create_post_button"]');
+                  if (createBtn && getText(createBtn)) return getText(createBtn);
+                  const candidates = [ ...q('button'), ...q('a'), ...q('[role="button"]') ];
+                  for (const el of candidates) {
+                    const t = getText(el).toLowerCase();
+                    if (!t) continue;
+                    if (t.includes('создать пост')) return getText(el);
+                    if (t.includes('предложить') && (t.includes('новост') || t.includes('пост') || t.includes('запись'))) return getText(el);
+                  }
+                  const blocks = q('.PostingReactBlock__root, .PostingFormBlock__root, [data-testid^="posting_"]');
+                  for (const b of blocks) {
+                    const btn = b.querySelector('button, a, [role="button"]');
+                    const t = getText(btn).toLowerCase();
+                    if (t.includes('создать пост') || t.includes('предложить')) return getText(btn);
+                  }
+                  return null;
+                }
+                """
+            )
+            if status:
+                return status
+        except Exception:
+            pass
+        page.wait_for_timeout(700)
+    # Fallback selectors
     selectors = [
         'button[data-testid="posting_create_post_button"]',
-        'div.PostingReactBlock__root button',
-        'section.vkitGroup__group--vFKdo button',
         'button:has-text("Создать пост")',
+        'button:has-text("Предложить")',
+        'a:has-text("Предложить новость")',
+        '.PostingReactBlock__root button',
+        '.PostingFormBlock__root button',
     ]
     for sel in selectors:
         try:
-            btn = page.query_selector(sel)
-            if btn:
-                txt = (btn.inner_text() or btn.text_content() or "").strip()
+            el = page.query_selector(sel)
+            if el:
+                txt = (el.inner_text() or el.text_content() or "").strip()
                 if txt:
                     return txt
         except Exception:
             continue
-    try:
-        # Ancillary heading near posting form
-        h2 = page.query_selector('h2:has-text("Добавление нового контента")')
-        if h2:
-            # Try to find any button inside same block
-            parent = h2
-            for _ in range(3):
-                parent = parent.query_selector('xpath=..') or parent
-            btn = parent.query_selector('button')
-            if btn:
-                txt = (btn.inner_text() or btn.text_content() or "").strip()
-                if txt:
-                    return txt
-    except Exception:
-        pass
-    return None
+    return "Недоступно"
 
 
 def infinite_scroll_and_collect(
@@ -505,11 +547,12 @@ def infinite_scroll_and_collect(
         for name, url, subs in found:
             if stop_event.is_set():
                 break
-            if url in already or url in collected_urls_local:
+            norm = normalize_vk_url(url)
+            if norm in already or norm in collected_urls_local:
                 continue
-            collected_urls_local.add(url)
+            collected_urls_local.add(norm)
             try:
-                on_item(name, url, subs)
+                on_item(name, norm, subs)
                 new_count += 1
                 if progress is not None:
                     progress.update(1)
@@ -552,21 +595,26 @@ def worker_collect_and_write(
             def on_item(name: str, url: str, subs: Optional[int]) -> None:
                 if stop_event.is_set():
                     return
+                norm = normalize_vk_url(url)
                 with seen_lock:
-                    if url in existing_urls:
+                    if norm in existing_urls:
                         return
-                    existing_urls.add(url)
+                    existing_urls.add(norm)
                 posting: Optional[str] = None
                 try:
-                    detail_page.goto(url)
+                    detail_page.goto(norm, wait_until="load")
+                    try:
+                        detail_page.wait_for_load_state("networkidle", timeout=3000)
+                    except Exception:
+                        pass
                     detail_page.wait_for_timeout(800)
                     posting = extract_posting_status(detail_page)
                 except Exception:
-                    posting = None
+                    posting = "Недоступно"
                 with index_lock:
                     index_ref[0] += 1
                     idx = index_ref[0]
-                item = GroupItem(index=idx, name=name, url=url, subscribers=subs, posting_status=posting)
+                item = GroupItem(index=idx, name=name, url=norm, subscribers=subs, posting_status=posting)
                 append_csv(output_csv, item)
                 append_xlsx(output_xlsx, item)
 
@@ -600,20 +648,14 @@ def run(
 
     state_file = os.path.abspath(STORAGE_STATE_FILE)
     ensure_parent_dir(state_file)
-    ensure_login_and_export_state(
-        user_data_dir=user_data_dir,
-        headless=headless,
-        login_timeout=login_timeout,
-        state_file=state_file,
-        auth_mode=auth_mode,
-    )
+    ensure_login_and_export_state(user_data_dir=user_data_dir, headless=headless, login_timeout=login_timeout, state_file=state_file, auth_mode=auth_mode)
 
     existing_urls: Set[str] = set()
     try:
         with open(output_csv, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                url = (row.get("Ссылка") or "").strip()
+                url = normalize_vk_url((row.get("Ссылка") or "").strip())
                 if url:
                     existing_urls.add(url)
     except FileNotFoundError:
