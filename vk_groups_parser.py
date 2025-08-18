@@ -208,21 +208,77 @@ def open_or_create_persistent_context(playwright: Playwright, user_data_dir: str
     return context, page
 
 
-def ensure_login_and_export_state(user_data_dir: str, headless: bool, login_timeout: int, state_file: str) -> None:
-    with sync_playwright() as p:
-        context, page = open_or_create_persistent_context(p, user_data_dir=user_data_dir, headless=headless)
+def ensure_login_and_export_state(user_data_dir: str, headless: bool, login_timeout: int, state_file: str, auth_mode: str = "auto") -> None:
+    """Prepare valid storage_state for subsequent new_context(storage_state=...).
+    auth_mode: 'auto' | 'storage_only' | 'profile_only'
+    - storage_only: use existing state_file if valid; do NOT open persistent profile or wait for login
+    - profile_only: use persistent profile (.vk_user_data) to export state (may wait for login)
+    - auto: try storage_state first; if invalid, try profile; if still invalid, wait for login (only if not headless)
+    """
+    from pathlib import Path
+    state_path = Path(state_file)
+
+    def validate_state_via_context(play: Playwright) -> bool:
         try:
-            page.goto(VK_GROUPS_URL)
+            browser = play.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])  # always headless for check
+            context = browser.new_context(storage_state=str(state_path), viewport={"width": 1400, "height": 900})
+            page = context.new_page()
+            try:
+                page.goto("https://vk.com/")
+                page.wait_for_timeout(800)
+                ok = is_logged_in(page)
+            finally:
+                context.close()
+                browser.close()
+            return ok
         except Exception:
+            return False
+
+    # 1) storage_only: trust and skip
+    if auth_mode == "storage_only":
+        if not state_path.exists():
+            raise RuntimeError("Требуется .vk_storage_state.json, но файл не найден. Перенесите его на сервер или используйте другой режим авторизации.")
+        # Optional quick validation to fail fast if явно невалидно
+        with sync_playwright() as p:
+            if not validate_state_via_context(p):
+                raise RuntimeError(".vk_storage_state.json невалиден/просрочен. Обновите файл авторизацией на локальной машине и скопируйте заново.")
+        return
+
+    # 2) auto/profile_only flows
+    with sync_playwright() as p:
+        # Try existing storage state first in auto-mode
+        if auth_mode in ("auto",) and state_path.exists():
+            if validate_state_via_context(p):
+                return
+
+        # If profile_only or storage invalid: try persistent profile and export
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            viewport={"width": 1400, "height": 900},
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
             page.goto("https://vk.com/")
+        except Exception:
+            pass
+
         if not is_logged_in(page):
-            print("Открылся VK. Пожалуйста, выполните вход (QR, пароль или через VK ID). Ожидаю завершения авторизации…", flush=True)
-            if headless:
-                print("Внимание: headless режим усложняет авторизацию. Рекомендуется без --headless.")
-            page.goto("https://vk.com/")
-            wait_for_login(page, timeout_sec=login_timeout)
-            print("Авторизация распознана, продолжаю…", flush=True)
-        context.storage_state(path=state_file)
+            if auth_mode == "profile_only":
+                # In profile_only we can wait (possibly under xvfb)
+                print("Открылся VK. Пожалуйста, выполните вход (QR, пароль или через VK ID). Ожидаю завершения авторизации…", flush=True)
+                wait_for_login(page, timeout_sec=login_timeout)
+            else:
+                # auto-mode and no login: if headless, do not block
+                if headless:
+                    context.close()
+                    raise RuntimeError("Нет валидной авторизации (.vk_storage_state.json), а профиль без входа. Либо используйте --auth-mode storage_only с валидным state, либо выполните вход под xvfb.")
+                print("Открылся VK. Пожалуйста, выполните вход (QR, пароль или через VK ID). Ожидаю завершения авторизации…", flush=True)
+                wait_for_login(page, timeout_sec=login_timeout)
+
+        # Export storage state
+        context.storage_state(path=str(state_path))
         context.close()
 
 
@@ -537,6 +593,7 @@ def run(
     headless: bool,
     max_per_query: int,
     login_timeout: int,
+    auth_mode: str,
 ) -> None:
     ensure_csv(output_csv)
     ensure_xlsx(output_xlsx)
@@ -548,6 +605,7 @@ def run(
         headless=headless,
         login_timeout=login_timeout,
         state_file=state_file,
+        auth_mode=auth_mode,
     )
 
     existing_urls: Set[str] = set()
@@ -614,9 +672,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--csv", default="./output/groups.csv", help="Путь к CSV файлу для сохранения.")
     parser.add_argument("--xlsx", default="./output/groups.xlsx", help="Путь к Excel файлу для сохранения.")
     parser.add_argument("--user-data-dir", default="./.vk_user_data", help="Каталог для хранения сессии браузера (куки).")
-    parser.add_argument("--headless", action="store_true", help="Запуск без интерфейса (для авторизации лучше без него).")
+    parser.add_argument("--headless", action="store_true", help="Запуск без интерфейса (для серверов/VDS используйте вместе с --auth-mode storage_only или xvfb-run).")
     parser.add_argument("--max-per-query", type=int, default=0, help="Максимум результатов на запрос. 0 или меньше = без лимита.")
     parser.add_argument("--login-timeout", type=int, default=300, help="Таймаут ожидания авторизации, сек.")
+    parser.add_argument("--auth-mode", choices=["auto", "storage_only", "profile_only"], default="auto", help="Режим авторизации: auto/storage_only/profile_only.")
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -633,6 +692,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             headless=args.headless,
             max_per_query=args.max_per_query,
             login_timeout=args.login_timeout,
+            auth_mode=args.auth_mode,
         )
         print(f"Готово. CSV: {csv_path}, XLSX: {xlsx_path}")
         return 0
