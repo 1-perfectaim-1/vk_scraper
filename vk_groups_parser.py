@@ -537,46 +537,52 @@ def infinite_scroll_and_collect(
 ) -> List[Tuple[str, str, Optional[int]]]:
     collected_urls_local: Set[str] = set()
     results: List[Tuple[str, str, Optional[int]]] = []
-    stagnant_rounds = 0
     unlimited = max_per_query is None or max_per_query <= 0
 
-    while not stop_event.is_set() and (unlimited or len(results) < max_per_query) and stagnant_rounds < 20:
+    while not stop_event.is_set():
         if not unlimited and len(results) >= max_per_query:
             break
         found = extract_group_cards(page)
-        new_count = 0
+        
+        newly_found_this_round: List[Tuple[str, str, Optional[int]]] = []
         for name, url, subs in found:
-            if stop_event.is_set() or (not unlimited and len(results) >= max_per_query):
+            if not unlimited and len(results) + len(newly_found_this_round) >= max_per_query:
                 break
             norm = normalize_vk_url(url)
             if norm in already or norm in collected_urls_local:
                 continue
+            
+            # Check against results just found in this batch to avoid duplicates from a single page grab
+            if any(item[1] == norm for item in newly_found_this_round):
+                continue
+
             collected_urls_local.add(norm)
-            results.append((name, norm, subs))
-            new_count += 1
+            newly_found_this_round.append((name, norm, subs))
 
-        if new_count == 0:
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
+        if newly_found_this_round:
+            results.extend(newly_found_this_round)
 
-        # Check for end-of-results marker
+        # Check for end-of-results marker as a potential stop condition, but don't rely on stagnation
         try:
             end_marker = page.query_selector(".EmptyCell, .SearchExtraInfo, .DivorceSearchExtraInfo, [data-testid='search-empty-results']")
             if end_marker and end_marker.is_visible():
-                break
+                # In an "infinite" scenario, we might want to wait and see if content appears later.
+                # For now, we'll keep scrolling, but this could be a point of future logic change if needed.
+                pass
         except Exception:
             pass
 
         try:
             page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
             try:
-                page.wait_for_load_state("networkidle", timeout=4000)
+                # Wait a bit longer to see if new content loads, since we are not stopping on stagnation
+                page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
-                page.wait_for_timeout(1000) # Fallback
+                page.wait_for_timeout(2000) # Fallback
         except Exception:
-            pass
-        page.wait_for_timeout(200) # Small delay to let UI render
+            # If scrolling fails, wait before retrying
+            page.wait_for_timeout(5000)
+            
     return results
 
 
