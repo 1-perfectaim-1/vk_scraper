@@ -533,54 +533,61 @@ def infinite_scroll_and_collect(
     page: Page,
     already: Set[str],
     max_per_query: int,
-    on_item: Callable[[str, str, Optional[int]], None],
     stop_event: threading.Event,
-    progress: Optional[tqdm] = None,
-) -> None:
+) -> List[Tuple[str, str, Optional[int]]]:
     collected_urls_local: Set[str] = set()
+    results: List[Tuple[str, str, Optional[int]]] = []
     stagnant_rounds = 0
     unlimited = max_per_query is None or max_per_query <= 0
 
-    while not stop_event.is_set() and (unlimited or len(collected_urls_local) < max_per_query) and stagnant_rounds < 10:
+    while not stop_event.is_set() and (unlimited or len(results) < max_per_query) and stagnant_rounds < 20:
+        if not unlimited and len(results) >= max_per_query:
+            break
         found = extract_group_cards(page)
         new_count = 0
         for name, url, subs in found:
-            if stop_event.is_set():
+            if stop_event.is_set() or (not unlimited and len(results) >= max_per_query):
                 break
             norm = normalize_vk_url(url)
             if norm in already or norm in collected_urls_local:
                 continue
             collected_urls_local.add(norm)
-            try:
-                on_item(name, norm, subs)
-                new_count += 1
-                if progress is not None:
-                    progress.update(1)
-            except Exception:
-                continue
+            results.append((name, norm, subs))
+            new_count += 1
+
         if new_count == 0:
             stagnant_rounds += 1
         else:
             stagnant_rounds = 0
+
+        # Check for end-of-results marker
         try:
-            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            end_marker = page.query_selector(".EmptyCell, .SearchExtraInfo, .DivorceSearchExtraInfo, [data-testid='search-empty-results']")
+            if end_marker and end_marker.is_visible():
+                break
         except Exception:
             pass
-        page.wait_for_timeout(1200)
+
+        try:
+            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            try:
+                page.wait_for_load_state("networkidle", timeout=4000)
+            except PlaywrightTimeoutError:
+                page.wait_for_timeout(1000) # Fallback
+        except Exception:
+            pass
+        page.wait_for_timeout(200) # Small delay to let UI render
+    return results
 
 
-def worker_collect_and_write(
+def worker_discover_groups(
     query: str,
     state_file: str,
     headless: bool,
     max_per_query: int,
-    output_csv: str,
-    output_xlsx: str,
     existing_urls: Set[str],
-    index_ref: List[int],
-    pbar: Optional[tqdm],
     stop_event: threading.Event,
-) -> None:
+) -> List[Tuple[str, str, Optional[int]]]:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -589,48 +596,22 @@ def worker_collect_and_write(
             )
             context = browser.new_context(storage_state=state_file, viewport={"width": 1400, "height": 900})
             page = context.new_page()
-            detail_page = context.new_page()
-            navigate_to_communities_search(page, query)
-
-            def on_item(name: str, url: str, subs: Optional[int]) -> None:
-                if stop_event.is_set():
-                    return
-                norm = normalize_vk_url(url)
-                with seen_lock:
-                    if norm in existing_urls:
-                        return
-                    existing_urls.add(norm)
-                posting: Optional[str] = None
-                try:
-                    detail_page.goto(norm, wait_until="load")
-                    try:
-                        detail_page.wait_for_load_state("networkidle", timeout=3000)
-                    except Exception:
-                        pass
-                    detail_page.wait_for_timeout(800)
-                    posting = extract_posting_status(detail_page)
-                except Exception:
-                    posting = "Недоступно"
-                with index_lock:
-                    index_ref[0] += 1
-                    idx = index_ref[0]
-                item = GroupItem(index=idx, name=name, url=norm, subscribers=subs, posting_status=posting)
-                append_csv(output_csv, item)
-                append_xlsx(output_xlsx, item)
-
-            infinite_scroll_and_collect(
-                page=page,
-                already=existing_urls,
-                max_per_query=max_per_query,
-                on_item=on_item,
-                stop_event=stop_event,
-                progress=pbar,
-            )
-            context.close()
-            browser.close()
+            try:
+                navigate_to_communities_search(page, query)
+                discovered = infinite_scroll_and_collect(
+                    page=page,
+                    already=existing_urls,
+                    max_per_query=max_per_query,
+                    stop_event=stop_event,
+                )
+                return discovered
+            finally:
+                context.close()
+                browser.close()
     except Exception as e:
         if not stop_event.is_set():
-            print(f"Поток для запроса '{query}' завершился с ошибкой: {e}", file=sys.stderr)
+            print(f"Поток поиска для '{query}' завершился с ошибкой: {e}", file=sys.stderr)
+        return []
 
 
 def run(
@@ -665,43 +646,65 @@ def run(
     try:
         with open(output_csv, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
-            for i, _ in enumerate(reader):
-                current_index = i
-    except FileNotFoundError:
+            # -1 because of header
+            current_index = sum(1 for _ in reader) - 1
+            if current_index < 0:
+                current_index = 0
+    except (FileNotFoundError, StopIteration):
         current_index = 0
 
-    index_ref = [current_index]
     stop_event = threading.Event()
 
-    total_target = None if (max_per_query is None or max_per_query <= 0) else len(query_list) * max_per_query
-    pbar_cm = tqdm(total=total_target, desc="Сбор результатов", unit="grp") if total_target is not None else tqdm(desc="Сбор результатов", unit="grp")
-    with pbar_cm as pbar:
-        try:
-            with ThreadPoolExecutor(max_workers=max(1, len(query_list))) as executor:
-                futures = [
-                    executor.submit(
-                        worker_collect_and_write,
-                        query,
-                        state_file,
-                        headless,
-                        max_per_query,
-                        output_csv,
-                        output_xlsx,
-                        existing_urls,
-                        index_ref,
-                        pbar,
-                        stop_event,
-                    )
-                    for query in query_list
-                ]
-                for _ in as_completed(futures):
-                    pass
-        except KeyboardInterrupt:
-            print("Остановка по Ctrl+C. Завершаю потоки…", file=sys.stderr)
-            stop_event.set()
-            time.sleep(1.0)
-        finally:
-            stop_event.set()
+    # --- Phase 1: Discovery ---
+    all_discovered: List[Tuple[str, str, Optional[int]]] = []
+    print("Этап 1: Поиск сообществ по запросам...")
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, len(query_list))) as executor:
+            futures = {
+                executor.submit(worker_discover_groups, query, state_file, headless, max_per_query, existing_urls, stop_event)
+                for query in query_list
+            }
+            with tqdm(total=len(futures), desc="Поисковые запросы", unit="q") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        results_per_query = future.result()
+                        if results_per_query:
+                            all_discovered.extend(results_per_query)
+                    except Exception as exc:
+                        print(f"Ошибка в потоке поиска: {exc}", file=sys.stderr)
+                    pbar.update(1)
+    except KeyboardInterrupt:
+        print("Остановка по Ctrl+C. Завершаю потоки поиска…", file=sys.stderr)
+        stop_event.set()
+        return
+
+    # --- Deduplication & Writing ---
+    unique_groups_to_write: List[Tuple[str, str, Optional[int]]] = []
+    seen_urls_after_discover = set(existing_urls)
+    for name, url, subs in all_discovered:
+        if url not in seen_urls_after_discover:
+            unique_groups_to_write.append((name, url, subs))
+            seen_urls_after_discover.add(url)
+
+    if stop_event.is_set():
+        return
+
+    if not unique_groups_to_write:
+        print("Новых уникальных сообществ для записи не найдено.")
+        return
+
+    print(f"\nНайдено {len(unique_groups_to_write)} новых сообществ. Запись в файлы...")
+
+    index_ref = [current_index]
+    with tqdm(total=len(unique_groups_to_write), desc="Запись результатов", unit="grp") as pbar:
+        for name, url, subs in unique_groups_to_write:
+            with index_lock:
+                index_ref[0] += 1
+                idx = index_ref[0]
+            item = GroupItem(index=idx, name=name, url=url, subscribers=subs, posting_status=None)
+            append_csv(output_csv, item)
+            append_xlsx(output_xlsx, item)
+            pbar.update(1)
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:

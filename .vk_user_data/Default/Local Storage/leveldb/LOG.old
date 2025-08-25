@@ -1,13 +1,3 @@
-2025/08/18-19:56:31.019 2f03 Reusing MANIFEST /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/Local Storage/leveldb/MANIFEST-000001
-2025/08/18-19:56:31.022 2f03 Recovering log #10
-2025/08/18-19:56:31.022 2f03 Level-0 table #12: started
-2025/08/18-19:56:31.027 2f03 Level-0 table #12: 30597 bytes OK
-2025/08/18-19:56:31.035 2f03 Delete type=0 #10
-2025/08/18-19:56:31.037 3903 Compacting 4@0 + 0@1 files
-2025/08/18-19:56:31.042 3903 Generated table #14@0: 65 keys, 44157 bytes
-2025/08/18-19:56:31.042 3903 Compacted 4@0 + 0@1 files => 44157 bytes
-2025/08/18-19:56:31.048 3903 compacted to: files[ 0 1 0 0 0 0 0 ]
-2025/08/18-19:56:31.048 3903 Delete type=2 #3
-2025/08/18-19:56:31.048 3903 Delete type=2 #7
-2025/08/18-19:56:31.048 3903 Delete type=2 #12
-2025/08/18-19:56:31.048 3903 Delete type=2 #9
+2025/08/23-22:26:23.885 3a03 Reusing MANIFEST /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/Local Storage/leveldb/MANIFEST-000001
+2025/08/23-22:26:23.888 3a03 Recovering log #13
+2025/08/23-22:26:23.888 3a03 Reusing old log /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/Local Storage/leveldb/000013.log 

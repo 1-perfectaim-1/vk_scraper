@@ -1,3 +1,3 @@
-2025/08/18-19:56:33.257 a003 Reusing MANIFEST /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/IndexedDB/https_vk.com_0.indexeddb.leveldb/MANIFEST-000001
-2025/08/18-19:56:33.257 a003 Recovering log #3
-2025/08/18-19:56:33.259 a003 Reusing old log /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/IndexedDB/https_vk.com_0.indexeddb.leveldb/000003.log 
+2025/08/18-20:09:46.999 8a03 Reusing MANIFEST /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/IndexedDB/https_vk.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/08/18-20:09:46.999 8a03 Recovering log #3
+2025/08/18-20:09:47.003 8a03 Reusing old log /Users/perfectaim/WORK/SCRIPTS/vk_scraper/.vk_user_data/Default/IndexedDB/https_vk.com_0.indexeddb.leveldb/000003.log 
